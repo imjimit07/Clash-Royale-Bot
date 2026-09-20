@@ -98,7 +98,7 @@ class FeatureEncoder:
             idx = self.card_to_index.get(normalize_card_name(name), self.card_to_index["unknown"])
             recent[idx] = 1.0
             out.extend(recent)
-        while len(state.recent_cards) < 3:
+        for _ in range(max(0, 3 - len(state.recent_cards))):
             out.extend([0.0] * len(self.vocabulary))
 
         vector = np.asarray(out, dtype=np.float32)

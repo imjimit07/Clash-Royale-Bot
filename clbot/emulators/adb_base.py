@@ -185,6 +185,102 @@ class AdbBasedController(BaseEmulatorController, ABC):
 
         return result
 
+    def ping(self) -> bool:
+        """Best-effort ADB liveness check."""
+        try:
+            result = self.adb("devices")
+            return result.returncode == 0 and bool(result.stdout)
+        except Exception:
+            return False
+
+    def ensure_adb_connection(self, retries: int = 3) -> bool:
+        """Reconnect ADB server/device; called at the start of every state path."""
+        import subprocess as _subprocess
+
+        for attempt in range(max(1, retries)):
+            try:
+                if self.ping():
+                    devices = self.list_devices()
+                    if not self.device_serial:
+                        return True
+                    for serial, status in devices:
+                        if serial == self.device_serial and status == "device":
+                            return True
+                    connect = getattr(self, "_connect", None)
+                    if callable(connect):
+                        try:
+                            if connect():
+                                return True
+                        except Exception:
+                            pass
+                    else:
+                        return True
+            except Exception:
+                pass
+            try:
+                logger.warning("ADB ping failed — reconnecting (#%d)", attempt + 1)
+            except Exception:
+                pass
+            try:
+                _subprocess.run(["adb", "kill-server"], shell=True, capture_output=True, check=False)
+                _subprocess.run(["adb", "start-server"], shell=True, capture_output=True, check=False)
+                if self.device_serial:
+                    _subprocess.run(
+                        ["adb", "connect", self.device_serial], shell=True, capture_output=True, check=False
+                    )
+            except Exception:
+                pass
+            time.sleep(3)
+        return False
+
+    def is_emulator_running(self) -> bool:
+        """Public crash-recovery probe; subclasses may override."""
+        check = getattr(self, "_is_emulator_running", None)
+        if callable(check):
+            try:
+                return bool(check())
+            except Exception:
+                return False
+        return self.ping()
+
+    def ensure_resolution(self, expected: tuple[int, int] = (419, 633)) -> bool:
+        """Verify screenshot dimensions match the 419x633 standard."""
+        try:
+            frame = self.screenshot()
+        except Exception:
+            return False
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return False
+        try:
+            h, w = frame.shape[:2]
+            return (w, h) == expected
+        except Exception:
+            return False
+
+    def ensure_window_focused(self) -> bool:
+        """Best-effort window focus via pygetwindow/win32gui; True if unavailable."""
+        try:
+            import pygetwindow as gw  # type: ignore
+
+            title = getattr(self, "window_title", "") or "Clash Royale"
+            wins = gw.getWindowsWithTitle(title)
+            if not wins:
+                return True
+            win = wins[0]
+            if not win.isActive:
+                win.activate()
+                time.sleep(0.3)
+            return True
+        except ImportError:
+            return True
+        except Exception as e:
+            logger.warning("Focus failed: %s", e)
+            return False
+
+    def reconnect_adb(self) -> bool:
+        """Alias kept for guide compatibility."""
+        return self.ensure_adb_connection()
+
     def is_app_installed(self, package: str) -> bool:
         return self._check_app_installed(package)
 

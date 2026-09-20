@@ -53,7 +53,8 @@ from clbot.bot.state_detect import (
 from clbot.utils.logger import Logger
 from clbot.utils.versioning import __version__
 
-ELIXIR_WAIT_TIMEOUT = 40  # too high but someone got errors with that so idk
+ELIXIR_WAIT_TIMEOUT = 20
+ELIXIR_POLL_INTERVAL = 0.3
 ABILITY_TRIGGER_DELAY_S = 3
 
 _ML_AGENT = BattleMLAgent()
@@ -332,13 +333,32 @@ def wait_for_elixir(
 
         # Throttle screenshot rate while elixir accumulates (each check above
         # screenshots). Keeps the wait purely elixir-gated without ADB spam.
-        time.sleep(0.2)
+        time.sleep(ELIXIR_POLL_INTERVAL)
 
     logger.change_status(
         f"Took {str(time.time() - start_time)[:4]}s for {elixir_wait_amount} elixir.",
     )
 
     return True
+
+
+def wait_for_elixir_with_timeout(scanner, target, logger, start_time, timeout: float = ELIXIR_WAIT_TIMEOUT):
+    """Poll a scanner with clock fallback until target elixir or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        elapsed = time.time() - start_time
+        try:
+            current = scanner.get_elixir_with_fallback(elapsed)
+        except Exception:
+            current = 0
+        if current is not None and current >= target:
+            return True
+        time.sleep(ELIXIR_POLL_INTERVAL)
+    try:
+        logger.log(f"Elixir wait timed out (target={target})")
+    except Exception:
+        pass
+    return False
 
 
 def end_fight_state(

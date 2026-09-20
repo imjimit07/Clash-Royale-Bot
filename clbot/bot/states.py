@@ -46,6 +46,82 @@ def handle_state_failure(logger: Logger, state_name: str, function_name: str, er
 mode_used_in_1v1 = None
 fight_mode_cycle_index = 0
 
+# --- State-machine hardening (Part 1.2 / 1.6 / Part 8) ---
+VALID_STATES = {
+    "start",
+    "restart",
+    "select_battle_mode",
+    "randomize_deck",
+    "cycle_deck",
+    "start_fight",
+    "1v1_fight",
+    "2v2_fight",
+    "end_fight",
+    "restart_emulator",
+    "press_back_and_retry",
+    "unknown",
+    "idle",
+    "fail",
+}
+
+# Per-state internal budgets (seconds). Long loops should bail to restart.
+STATE_BUDGETS = {
+    "select_battle_mode": 60,
+    "randomize_deck": 60,
+    "cycle_deck": 60,
+    "start_fight": 45,
+    "1v1_fight": 180,
+    "2v2_fight": 180,
+    "end_fight": 45,
+}
+
+ERROR_MESSAGES = {
+    "black_frame": "Emulator render failure — check rendering mode (OpenGL/DirectX/Vulkan).",
+    "adb_disconnect": "ADB connection lost — check emulator ADB port and firewall.",
+    "elixir_not_found": "Elixir bar not detected — recalibrate HSV in config.yaml.",
+    "unknown_screen": "Unrecognized screen — game may have updated; templates need refreshing.",
+    "window_not_focused": "Emulator window lost focus — click on it and retry.",
+}
+
+UNKNOWN_SCREEN_LIMIT = 3
+_unknown_screen_count = 0
+
+
+def safe_next_state(state_order, current, logger=None):
+    """Validate transitions; never propagate an invalid sentinel."""
+    try:
+        nxt = state_order.next_state(current)
+    except Exception:
+        return "restart"
+    if nxt not in VALID_STATES:
+        if logger is not None:
+            try:
+                logger.error(f"Invalid state transition {current} -> {nxt}")
+            except Exception:
+                pass
+        return "restart"
+    return nxt
+
+
+def note_unknown_screen(logger=None) -> str:
+    """Count consecutive unknown screens; escalate to back-and-retry."""
+    global _unknown_screen_count
+    _unknown_screen_count += 1
+    if logger is not None:
+        try:
+            logger.log(f"Unknown screen (#{_unknown_screen_count})")
+        except Exception:
+            pass
+    if _unknown_screen_count >= UNKNOWN_SCREEN_LIMIT:
+        _unknown_screen_count = 0
+        return "press_back_and_retry"
+    return "unknown"
+
+
+def note_known_screen() -> None:
+    global _unknown_screen_count
+    _unknown_screen_count = 0
+
 
 def any_fight_mode_enabled(job_list) -> bool:
     return any(
@@ -211,12 +287,12 @@ class StateOrder:
         ]
 
     def next_state(self, curr_state):
-        if curr_state in ["restart", "start"]:
+        if curr_state in ["restart", "start", "restart_emulator", "press_back_and_retry", "unknown"]:
             return self.states[0]
 
         if curr_state not in self.states:
             print(f'[!] Fatal error: state "{curr_state}" not in state order')
-            return "No next state found!"
+            return "restart"
 
         this_index = self.states.index(curr_state)
 
@@ -225,7 +301,11 @@ class StateOrder:
             return self.states[0]
 
         # else, return next state
-        return self.states[this_index + 1]
+        nxt = self.states[this_index + 1]
+        if nxt not in VALID_STATES:
+            print(f"[!] Fatal error: invalid next state {curr_state} -> {nxt}")
+            return "restart"
+        return nxt
 
 
 # States whose lines are kept out of the terminal (still written to the log
@@ -260,6 +340,10 @@ def state_tree(
         logger.error("State machine entered 'fail' state - stopping execution")
         logger.add_restart_after_failure()
         raise RuntimeError("State machine entered fail state - unrecoverable error")
+
+    if state not in VALID_STATES and state not in (None, "fail"):
+        logger.error(f"Failure in state tree: unknown state '{state}' — restarting")
+        return "restart"
 
     if state == "start":
         return state_order.next_state(state)

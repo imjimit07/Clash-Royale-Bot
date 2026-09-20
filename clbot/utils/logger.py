@@ -75,6 +75,28 @@ def attach_worker_file_logging(session_log_path: str) -> None:
     _attach_log_file_handler(session_log_path)
 
 
+def setup_logger(log_dir: str = "logs", name: str = "clbot", level: int = logging.INFO):
+    """Structured rotating logger (Part 4.1). Safe to call alongside initialize_pylogging."""
+    import os
+
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in logger.handlers):
+        from logging.handlers import RotatingFileHandler
+
+        fh = RotatingFileHandler(f"{log_dir}/bot.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        fh.setLevel(logging.DEBUG)
+        logger.addHandler(fh)
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        logger.addHandler(ch)
+    return logger
+
+
 def initialize_pylogging() -> None:
     """Method to be called once to initialize python logging"""
     _attach_log_file_handler(log_name)

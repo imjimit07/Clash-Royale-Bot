@@ -1,4 +1,5 @@
 import os
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from os.path import abspath, dirname, join
 
@@ -6,6 +7,140 @@ import cv2
 import numpy as np
 
 from clbot.utils.image_handler import open_from_path
+
+DEFAULT_TOLERANCE = 0.88
+FALLBACK_TOLERANCE = 0.78
+BLACK_FRAME_THRESHOLD = 5
+
+# Template cache (Part 7.1): load once at startup, reuse across matches.
+_TEMPLATE_CACHE: dict[str, np.ndarray] = {}
+
+# Region-of-interest presets in full-frame coords (Part 7.2).
+REGIONS = {
+    "elixir_bar": (100, 880, 880, 20),
+    "hand_cards": (100, 950, 1720, 130),
+    "tower_left": (0, 500, 400, 400),
+    "tower_right": (1520, 500, 400, 400),
+}
+
+
+def load_templates(directory: str) -> dict[str, np.ndarray]:
+    """Load every .png in directory into the process-wide cache."""
+    for fname in os.listdir(directory):
+        if fname.endswith(".png"):
+            path = join(directory, fname)
+            try:
+                _TEMPLATE_CACHE[path] = open_from_path(path)
+            except Exception:
+                continue
+    return _TEMPLATE_CACHE
+
+
+def get_template(name: str) -> np.ndarray | None:
+    return _TEMPLATE_CACHE.get(name)
+
+
+def get_roi(frame: np.ndarray, name: str) -> np.ndarray:
+    """Crop a named region; unknown names return the full frame."""
+    if name not in REGIONS:
+        return frame
+    x, y, w, h = REGIONS[name]
+    h_frame, w_frame = frame.shape[:2]
+    x2, y2 = min(w_frame, x + w), min(h_frame, y + h)
+    return frame[y:y2, x:x2]
+
+
+def is_blank_frame(frame: np.ndarray | None) -> bool:
+    """Detect black/blank screenshots that indicate a render failure."""
+    if frame is None:
+        return True
+    try:
+        if getattr(frame, "size", 0) == 0:
+            return True
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return float(gray.mean()) < BLACK_FRAME_THRESHOLD
+    except Exception:
+        return True
+
+
+def save_debug_screenshot(frame: np.ndarray | None, tag: str = "unknown") -> str | None:
+    """Persist a failure frame under debug_screens/; best-effort."""
+    if frame is None:
+        return None
+    try:
+        os.makedirs("debug_screens", exist_ok=True)
+        path = f"debug_screens/{tag}_{int(time.time())}.png"
+        cv2.imwrite(path, frame)
+        return path
+    except Exception:
+        return None
+
+
+def compare_images_multi_scale(
+    image: np.ndarray,
+    template: np.ndarray,
+    threshold: float = DEFAULT_TOLERANCE,
+    scales: tuple[float, ...] = (1.0, 0.95, 1.05),
+) -> dict | None:
+    """Grayscale multi-scale match; returns location/confidence dict or None."""
+    best = None
+    for scale in scales:
+        needle = template if scale == 1.0 else cv2.resize(template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        loc = compare_images(image, needle, threshold=threshold)
+        if loc is not None:
+            return {"location": loc, "confidence": threshold, "scale": scale}
+        # Track best-effort confidence for diagnostics.
+        try:
+            img_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            tpl_gray = cv2.cvtColor(needle, cv2.COLOR_RGB2GRAY)
+            if tpl_gray.shape[0] <= img_gray.shape[0] and tpl_gray.shape[1] <= img_gray.shape[1]:
+                res = cv2.matchTemplate(img_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                if best is None or max_val > best["confidence"]:
+                    best = {"location": [int(max_loc[1]), int(max_loc[0])], "confidence": float(max_val), "scale": scale}
+        except Exception:
+            continue
+    return None
+
+
+def find_image_single(
+    haystack: np.ndarray,
+    needle_path: str,
+    tolerance: float = DEFAULT_TOLERANCE,
+    region=None,
+    multi_scale: bool = True,
+) -> dict | None:
+    """Single-template match with fallback tolerances; returns dict or None."""
+    if haystack is None or is_blank_frame(haystack):
+        return None
+    search = haystack
+    if region:
+        x, y, w, h = region
+        search = haystack[y : y + h, x : x + w]
+    try:
+        needle = get_template(needle_path) or open_from_path(needle_path)
+    except Exception:
+        return None
+    tolerances = [tolerance, (tolerance + FALLBACK_TOLERANCE) / 2, FALLBACK_TOLERANCE]
+    scales = (1.0, 0.95, 1.05) if multi_scale else (1.0,)
+    best = None
+    for scale in scales:
+        scaled = needle if scale == 1.0 else cv2.resize(needle, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        if scaled.shape[0] > search.shape[0] or scaled.shape[1] > search.shape[1]:
+            continue
+        try:
+            img_gray = cv2.cvtColor(search, cv2.COLOR_RGB2GRAY)
+            tpl_gray = cv2.cvtColor(scaled, cv2.COLOR_RGB2GRAY)
+            res = cv2.matchTemplate(img_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        except Exception:
+            continue
+        for tol in tolerances:
+            if max_val >= tol:
+                return {"location": max_loc, "confidence": float(max_val), "scale": scale, "tolerance_used": tol}
+        if best is None or max_val > best["confidence"]:
+            best = {"location": max_loc, "confidence": float(max_val), "scale": scale}
+    return None
 
 # =============================================================================
 # IMAGE RECOGNITION FUNCTIONS
@@ -18,6 +153,8 @@ def find_image(
     tolerance: float = 0.88,
     subcrop: tuple[int, int, int, int] | None = None,
     show_image: bool = False,
+    multi_scale: bool = False,
+    fallback_tolerance: float = FALLBACK_TOLERANCE,
 ) -> tuple[int, int] | None:
     """Find the first matching reference image in a screenshot
 
@@ -30,6 +167,8 @@ def find_image(
     Returns:
         tuple[int, int] | None: (x, y) coordinates of found image relative to full image, or None if not found
     """
+    if image is None or is_blank_frame(image):
+        return None
     search_image = image
     offset_x, offset_y = 0, 0
 
@@ -43,16 +182,17 @@ def find_image(
     #     plt.title(f"Searching for {folder} in image")
     #     plt.show()
 
-    locations, filenames = find_references(search_image, folder, tolerance)
-    coord = get_first_location(locations)
-    if coord is not None:
-        # Find which file matched
-        for i, location in enumerate(locations):
-            if location is not None:
-                print(f"Match found in file: {filenames[i]}")
-                break
-        # Convert from [y, x] to (x, y) and add offset to get coordinates relative to full image
-        return (coord[1] + offset_x, coord[0] + offset_y)
+    for tol in (tolerance, (tolerance + fallback_tolerance) / 2, fallback_tolerance):
+        locations, filenames = find_references(search_image, folder, tol)
+        coord = get_first_location(locations)
+        if coord is not None:
+            # Find which file matched
+            for i, location in enumerate(locations):
+                if location is not None:
+                    print(f"Match found in file: {filenames[i]}")
+                    break
+            # Convert from [y, x] to (x, y) and add offset to get coordinates relative to full image
+            return (coord[1] + offset_x, coord[0] + offset_y)
     return None
 
 

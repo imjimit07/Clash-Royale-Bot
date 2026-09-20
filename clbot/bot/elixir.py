@@ -13,8 +13,95 @@ import numpy as np
 from clbot.bot.coords import ELIXIR_BAR_X_END, ELIXIR_BAR_X_START, ELIXIR_BAR_Y
 
 
+DEFAULT_HSV_LOW = np.array([125, 80, 80])
+DEFAULT_HSV_HIGH = np.array([165, 255, 255])
+CONSECUTIVE_FAIL_LIMIT = 5
+
+ELIXIR_WAIT_TIMEOUT = 20
+ELIXIR_POLL_INTERVAL = 0.3
+
+
 class ElixirScanner:
     """Exact 0-10 elixir count from the horizontal purple fill bar."""
+
+    def __init__(self, emulator=None, logger=None, hsv_low=None, hsv_high=None):
+        self.emulator = emulator
+        self.logger = logger
+        self.hsv_low = hsv_low if hsv_low is not None else DEFAULT_HSV_LOW.copy()
+        self.hsv_high = hsv_high if hsv_high is not None else DEFAULT_HSV_HIGH.copy()
+        self.fail_count = 0
+        self.last_known_elixir = 0
+        self.last_known_time = 0.0
+        try:
+            import time as _time
+
+            self.last_known_time = _time.time()
+        except Exception:
+            pass
+
+    def scan(self, frame=None):
+        """Instance scan with fail counting; returns 0-10 or None."""
+        import time as _time
+
+        try:
+            if frame is None and self.emulator is not None:
+                frame = self.emulator.screenshot()
+            value = ElixirScanner.read_elixir_optional(frame)
+            if value is None:
+                self._on_fail("unreadable frame")
+                return None
+            self.fail_count = 0
+            self.last_known_elixir = int(value)
+            self.last_known_time = _time.time()
+            return int(value)
+        except Exception as e:
+            self._on_fail(str(e))
+            return None
+
+    def _on_fail(self, reason: str) -> None:
+        self.fail_count += 1
+        if self.logger is not None:
+            try:
+                self.logger.log(f"Elixir scan fail #{self.fail_count}: {reason}")
+            except Exception:
+                pass
+
+    def get_elixir_with_fallback(self, elapsed_seconds: float = 0.0, frame=None):
+        """Clock-based estimate after repeated failures (1 per 2.8s)."""
+        val = self.scan(frame)
+        if val is not None:
+            return val
+        if self.fail_count >= CONSECUTIVE_FAIL_LIMIT:
+            estimated = min(10, self.last_known_elixir + float(elapsed_seconds) / 2.8)
+            if self.logger is not None:
+                try:
+                    self.logger.log(f"Elixir detection failing — using estimate {estimated:.1f}")
+                except Exception:
+                    pass
+            return estimated
+        return self.last_known_elixir
+
+    def calibrate(self, sample_frame=None) -> bool:
+        """Refine HSV bounds from a known full-bar sample; best-effort."""
+        try:
+            if sample_frame is None and self.emulator is not None:
+                sample_frame = self.emulator.screenshot()
+            if sample_frame is None:
+                return False
+            h, w = sample_frame.shape[:2]
+            y1 = max(0, ELIXIR_BAR_Y - 2)
+            y2 = min(h, ELIXIR_BAR_Y + 2)
+            strip = sample_frame[y1:y2, max(0, ELIXIR_BAR_X_START) : min(w, ELIXIR_BAR_X_END)]
+            hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+            hue = hsv[:, :, 0].ravel()
+            if hue.size == 0:
+                return False
+            lo, hi = float(np.percentile(hue, 5)), float(np.percentile(hue, 95))
+            self.hsv_low = np.array([max(0, lo - 10), 80, 80])
+            self.hsv_high = np.array([min(179, hi + 10), 255, 255])
+            return True
+        except Exception:
+            return False
 
     @classmethod
     def read_elixir_optional(cls, screen_frame: np.ndarray | None) -> int | None:
