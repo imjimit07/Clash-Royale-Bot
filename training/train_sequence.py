@@ -86,6 +86,9 @@ def main() -> int:
     card_loss_fn = nn.CrossEntropyLoss(weight=torch.from_numpy(card_weights))
     placement_loss_fn = nn.CrossEntropyLoss()
 
+    best_val = float("inf")
+    best_state = None
+    best_epoch = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         total = 0.0
@@ -117,6 +120,14 @@ def main() -> int:
                 val_count = len(vx)
         suffix = f" val_loss={val_loss:.4f}" if val_count else ""
         print(f"epoch={epoch:03d} train_loss={total/len(ds):.4f}{suffix}")
+        if val_count and val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"Best val_loss={best_val:.4f} at epoch {best_epoch} — checkpointing best, not last")
 
     args.model.parent.mkdir(parents=True, exist_ok=True)
     encoder_path = args.model.with_name("features.json")
