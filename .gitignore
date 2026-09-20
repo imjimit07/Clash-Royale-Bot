@@ -1,0 +1,5 @@
+.pytest_cache/
+.venv/
+clbot.egg-info/
+debug_screens/
+tests/
