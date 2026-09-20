@@ -6,7 +6,7 @@ import random
 import time
 from typing import Literal
 
-from clbot.bot.card_database import resolve_card
+from clbot.bot.card_database import lookup_card, resolve_card
 from clbot.bot.card_detection import (
     check_which_cards_are_available,
     create_default_bridge_iar,

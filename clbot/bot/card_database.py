@@ -213,6 +213,9 @@ def lookup_card(card_name: str) -> dict[str, object] | None:
     return None
 
 
+__all__ = ["lookup_card", "resolve_card", "normalize_card_id", "ALL_CARDS", "CARD_ALIASES"]
+
+
 def resolve_card(card_name: str) -> dict[str, object]:
     """Look up ``{"role", "cost", "target"}`` with name sanitation.
 

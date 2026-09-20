@@ -171,6 +171,25 @@ class WorkerProcess(Process):
             traceback.print_exc()
             return False
 
+    def _capture_failure(self, emulator, logger, state: str) -> None:
+        """Best-effort debug screenshot + crash dump; never raises."""
+        try:
+            from clbot.utils.diagnostics import dump_crash, save_debug_screenshot
+
+            frame = None
+            try:
+                frame = emulator.screenshot()
+            except Exception:
+                frame = None
+            save_debug_screenshot(frame, tag=str(state))
+            try:
+                history = getattr(self, "_last_state_history", [])
+            except Exception:
+                history = []
+            dump_crash(logger, state, history)
+        except Exception:
+            pass
+
     def _run_bot_loop(self, emulator, jobs: dict[str, Any], logger: ProcessLogger) -> None:
         """Run the main bot state loop with watchdog, backoff and escalation."""
         state = "start"
@@ -222,6 +241,7 @@ class WorkerProcess(Process):
 
                 if new_state is None:
                     logger.error(f"WATCHDOG: State '{state}' exceeded {STATE_TIMEOUT_SECONDS}s — forcing restart")
+                    self._capture_failure(emulator, logger, state)
                     new_state = "restart"
 
                 loop_detector.push(str(new_state))
@@ -268,7 +288,11 @@ class WorkerProcess(Process):
                 logger.log(f"Current state was: {state}")
                 print(f"[ERROR] Exception in state_tree: {e}")
                 traceback.print_exc()
-                state = "restart"
+                self._capture_failure(emulator, logger, state)
+                # Light recovery first: BACK out to menu. Emulator reboot is
+                # the escalation path below, not the first response to a
+                # Python exception.
+                state = "press_back_and_retry"
                 consecutive_restarts += 1
                 if consecutive_restarts >= MAX_CONSECUTIVE_RESTARTS:
                     logger.error("Too many consecutive exceptions — attempting full emulator restart")

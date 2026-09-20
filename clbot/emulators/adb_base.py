@@ -281,6 +281,14 @@ class AdbBasedController(BaseEmulatorController, ABC):
         """Alias kept for guide compatibility."""
         return self.ensure_adb_connection()
 
+    def press_back(self) -> bool:
+        """Send Android BACK (keyevent 4); lightweight menu-recovery primitive."""
+        try:
+            result = self.adb("shell input keyevent 4")
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def is_app_installed(self, package: str) -> bool:
         return self._check_app_installed(package)
 

@@ -529,6 +529,21 @@ def state_tree(
 
         return state_order.next_state(state)
 
+    if state == "press_back_and_retry":
+        # Lightweight recovery for Python exceptions: BACK out to a known
+        # screen instead of rebooting the emulator. Falls through to normal
+        # mode selection on the next loop.
+        try:
+            press = getattr(emulator, "press_back", None)
+            if callable(press):
+                press()
+            else:
+                emulator.click(35, 500)
+        except Exception as e:
+            logger.log(f"Menu recovery tap failed: {e}")
+        time.sleep(2)
+        return state_order.next_state("restart")
+
     logger.error("Failure in state tree")
     return "fail"
 
