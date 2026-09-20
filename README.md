@@ -141,6 +141,8 @@ clbot/
 └── utils/                   logger, admin check, diagnostics, versioning
 ```
 
+![algorithm](assets/diagram.png)
+
 ### State machine
 
 ```
