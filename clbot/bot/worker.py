@@ -109,7 +109,17 @@ class WorkerProcess(Process):
             return None
 
     def _run_state_with_timeout(self, emulator, logger, state, jobs, state_history, state_order, timeout: float):
-        """Run one state_tree call in a daemon thread; return None on timeout."""
+        """Run one state_tree call in a daemon thread; return None on timeout.
+
+        The timeout measures *progress staleness*, not wall time since entry:
+        long states (a ~180s+ battle) pulse ``clbot.bot.watchdog`` as they
+        work, so only a genuinely silent state trips recovery. On timeout a
+        cooperative stop is requested so the stray thread exits instead of
+        acting behind the main loop's back (Python cannot kill threads).
+        """
+        from clbot.bot import watchdog as _watchdog
+
+        _watchdog.reset()
         result: dict[str, Any] = {"value": None, "done": False}
 
         def target() -> None:
@@ -126,9 +136,21 @@ class WorkerProcess(Process):
 
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
-        thread.join(timeout)
-        if not result["done"]:
-            return None
+        while not result["done"]:
+            thread.join(timeout=1.0)
+            if result["done"]:
+                break
+            if _watchdog.is_stale(timeout):
+                stale = _watchdog.staleness_s()
+                try:
+                    logger.error(
+                        f"WATCHDOG: State '{state}' had no progress for {stale:.0f}s "
+                        f"(staleness timeout {timeout}s) — forcing restart"
+                    )
+                except Exception:
+                    pass
+                _watchdog.request_stop()
+                return None
         return result["value"]
 
     def _restart_emulator(self, emulator, logger) -> bool:

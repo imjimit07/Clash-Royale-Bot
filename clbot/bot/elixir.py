@@ -16,6 +16,11 @@ from clbot.bot.coords import ELIXIR_BAR_X_END, ELIXIR_BAR_X_START, ELIXIR_BAR_Y
 DEFAULT_HSV_LOW = np.array([125, 80, 80])
 DEFAULT_HSV_HIGH = np.array([165, 255, 255])
 CONSECUTIVE_FAIL_LIMIT = 5
+# A fully black screenshot is a capture failure (emulator transition/ADB
+# mid-refresh), not a measurement of an empty bar. Max-based (not mean-based
+# like detection.image_rec.is_blank_frame): any content at all means the frame
+# is scannable — a real empty bar still has bright UI/arena pixels elsewhere.
+BLANK_FRAME_MAX_THRESHOLD = 5
 
 ELIXIR_WAIT_TIMEOUT = 20
 ELIXIR_POLL_INTERVAL = 0.3
@@ -111,6 +116,12 @@ class ElixirScanner:
         try:
             if screen_frame.ndim != 3 or screen_frame.shape[2] != 3:
                 return None
+            try:
+                gray = cv2.cvtColor(screen_frame, cv2.COLOR_BGR2GRAY)
+                if int(gray.max()) < BLANK_FRAME_MAX_THRESHOLD:
+                    return None
+            except Exception:
+                pass
             h, w = screen_frame.shape[:2]
             y1 = max(0, ELIXIR_BAR_Y - 2)
             y2 = min(h, ELIXIR_BAR_Y + 2)
@@ -125,18 +136,26 @@ class ElixirScanner:
             upper_purple = np.array([165, 255, 255])
             mask = cv2.inRange(hsv, lower_purple, upper_purple)
 
-            rows = mask.shape[0]
-            filled_pixels = 0
-            for x in range(mask.shape[1]):
-                if int(np.sum(mask[:, x])) <= 100 * rows:
-                    break
-                filled_pixels += 1
-
-            total_width = x2 - x1
+            total_width = mask.shape[1]
             if total_width <= 0:
                 return None
-            elixir_count = int(round(filled_pixels / total_width * 10))
-            return max(0, min(10, elixir_count))
+            # Per-pip majority, contiguous from the left. Pip dividers and bar
+            # edge caps interrupt individual columns, so a strict column scan
+            # stops at the first divider and live full bars read 0. A pip
+            # counts when over half its pixels match; counting stops at the
+            # first unfilled pip so fill past a glitched gap can't inflate the
+            # read (see test_broken_fill_stops_at_first_gap).
+            PIP_FILL_FRACTION = 0.5
+            filled_pips = 0
+            for i in range(10):
+                seg = mask[:, int(i * total_width / 10) : int((i + 1) * total_width / 10)]
+                if seg.size == 0:
+                    break
+                if float(np.count_nonzero(seg)) / seg.size > PIP_FILL_FRACTION:
+                    filled_pips += 1
+                else:
+                    break
+            return max(0, min(10, filled_pips))
         except Exception:
             return None
 
@@ -166,7 +185,7 @@ class ElixirTracker:
 
     def __init__(self) -> None:
         self.estimate = self.START_ELIXIR
-        self._last_update = 0.0
+        self._last_update: float | None = None
         self._low_streak = 0
 
     def start_match(self, now: float) -> None:
@@ -186,6 +205,12 @@ class ElixirTracker:
 
     def accrue(self, now: float, match_elapsed_s: float) -> float:
         """Bank generated elixir up to the 10 cap; returns the estimate."""
+        if self._last_update is None:
+            # Fresh tracker that never saw start_match (e.g. random-plays loop
+            # on a new process): start the clock now instead of banking
+            # epoch-to-now wall time straight to the 10 cap.
+            self._last_update = now
+            return self.estimate
         forwarded = max(0.0, now - self._last_update)
         self._last_update = now
         self.estimate = min(self.MAX_ELIXIR, self.estimate + forwarded * self.rate_per_second(match_elapsed_s))

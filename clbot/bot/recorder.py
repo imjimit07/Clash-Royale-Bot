@@ -341,10 +341,17 @@ class FightPackRecorder:
                 next_t = time.time()  # behind schedule; resync
 
     def _write_frame(self, frame: np.ndarray) -> None:
-        if self.frames_source == "ffv1" and self._writer is not None:
-            self._writer.write(frame)  # BGR in, BGR out
-        elif self._frames_dir is not None:
-            cv2.imwrite(os.path.join(self._frames_dir, f"{self._frame_count:06d}.png"), frame)
+        # Never let a torn frame during teardown kill the capture thread (the
+        # native libpng note on stderr is harmless and uncatchable from here).
+        try:
+            if frame is None or getattr(frame, "size", 0) == 0:
+                return
+            if self.frames_source == "ffv1" and self._writer is not None:
+                self._writer.write(frame)  # BGR in, BGR out
+            elif self._frames_dir is not None:
+                cv2.imwrite(os.path.join(self._frames_dir, f"{self._frame_count:06d}.png"), frame)
+        except Exception as e:
+            self._log(f"Frame write failed: {e}")
 
     def _append_play_line_locked(self, entry: dict) -> None:
         if self._plays_file is None:

@@ -26,6 +26,8 @@ from clbot.bot.coords import (
 )
 from clbot.bot.elixir import ElixirScanner, ElixirTracker
 from clbot.bot.ml_agent import AdvancedCombatAI, BattleMLAgent, TacticalAIEngine, get_current_elixir
+from clbot.bot.watchdog import pulse as _watchdog_pulse
+from clbot.bot.watchdog import stop_requested as _watchdog_stop_requested
 from clbot.bot.ml.inference import LearnedPolicy
 from clbot.bot.ml.state import EnemyThreat, GameState, HandCard
 from clbot.bot.nav import (
@@ -66,6 +68,23 @@ _recent_card_names: collections.deque[str] = collections.deque(maxlen=3)
 _last_hold_record_time = 0.0
 _last_hold_record_key: tuple | None = None
 _VERIFY_DEPLOYS = os.getenv("CLBOT_VERIFY_DEPLOYS", "1").strip().lower() not in {"0", "false", "no", "off"}
+# Temporary diagnostic: counts wait_for_elixir entries per process to tell
+# outer-loop re-entry (H2) apart from a single stuck wait (H1/H4). Remove
+# once the elixir-wait symptom is diagnosed.
+_DIAG_WAIT_ENTRY_COUNT = 0
+_DIAG_LAST_PNG_ENTRY = None
+
+
+def _diag_png_enabled() -> bool:
+    """Temporary diagnostics write PNGs unless explicitly disabled.
+
+    Set ``CLBOT_DIAG_PNG=0`` (e.g. in tests) to keep ``debug_screens/``
+    free of test artifacts. Remove with the rest of the DIAG code.
+    """
+    try:
+        return os.getenv("CLBOT_DIAG_PNG", "1") != "0"
+    except Exception:
+        return True
 
 
 def _read_elixir_optional(frame):
@@ -247,7 +266,9 @@ def wait_for_elixir(
     compatibility with existing callers but are no longer consulted.
     """
     _ = (WAIT_THRESHOLD, PLAY_THRESHOLD, recording_flag)
+    global _DIAG_LAST_PNG_ENTRY
     start_time = time.time()
+    _watchdog_pulse()
     battle_detection_lost_count = 0
     last_logged_second = -1
     last_lost_detection_log_second = -1
@@ -255,6 +276,9 @@ def wait_for_elixir(
     ability_available_since = None
 
     while True:
+        if _watchdog_stop_requested():
+            logger.change_status("Stop requested — leaving elixir wait")
+            return "restart"
         match_elapsed = time.time() - start_time
         try:
             frame_now = emulator.screenshot()
@@ -274,6 +298,26 @@ def wait_for_elixir(
             logger.change_status(
                 f"Waiting for {elixir_wait_amount} elixir for {elapsed_second}s...",
             )
+            # Heartbeat: waiting *is* progress (elixir accrues every second).
+            _watchdog_pulse()
+            # Temporary diagnostic (H2 vs H4): raw scanner vs gated value,
+            # wait-elapsed, and outer entry id — one line per second.
+            try:
+                _diag_raw = locals().get("observed_now", None)
+                logger.log(
+                    f"DIAG elixir raw={_diag_raw} "
+                    f"fused={observed_amount} match_elapsed={match_elapsed:.1f} "
+                    f"wait_elapsed={wait_time:.1f} entry=#{_DIAG_WAIT_ENTRY_COUNT}"
+                )
+                if _diag_raw is not None and int(_diag_raw) < int(elixir_wait_amount) and _diag_png_enabled():
+                    import cv2 as _cv2
+
+                    import os as _os
+
+                    _os.makedirs("debug_screens", exist_ok=True)
+                    _cv2.imwrite(f"debug_screens/elixir_wait_{int(time.time())}.png", frame_now)
+            except Exception:
+                pass
             last_logged_second = elapsed_second
 
         if is_hero_champion_ability_visible(emulator):
@@ -327,9 +371,36 @@ def wait_for_elixir(
                 answers = check_which_cards_are_available(emulator) if threat else []
             except Exception:
                 threat, answers = False, []
+                _count = 0
+            # Temporary diagnostic (H1): log both halves of the break AND.
+            try:
+                logger.log(
+                    f"DIAG defense break: threat={bool(threat)} count={int(_count)} "
+                    f"affordable={len(answers) if answers else 0} entry=#{_DIAG_WAIT_ENTRY_COUNT}"
+                )
+            except Exception:
+                pass
             if threat and answers:
                 logger.change_status("Breaking elixir wait to defend the push")
                 return True
+            # Temporary diagnostic (H1 frame): one board PNG per wait entry on
+            # any non-breaking gate evaluation — covers both threat=0 with
+            # troops visible and threat=1 with affordable=0. The per-second
+            # elixir PNG only fires when raw < target, i.e. never on a
+            # full-bar H1 wait.
+            try:
+                if _DIAG_LAST_PNG_ENTRY != _DIAG_WAIT_ENTRY_COUNT and _diag_png_enabled():
+                    _diag_gate_frame = locals().get("frame", None)
+                    if _diag_gate_frame is not None:
+                        import cv2 as _cv2g
+
+                        import os as _osg
+
+                        _osg.makedirs("debug_screens", exist_ok=True)
+                        _cv2g.imwrite(f"debug_screens/h1_gate_{_DIAG_WAIT_ENTRY_COUNT}.png", _diag_gate_frame)
+                        _DIAG_LAST_PNG_ENTRY = _DIAG_WAIT_ENTRY_COUNT
+            except Exception:
+                pass
 
         # Throttle screenshot rate while elixir accumulates (each check above
         # screenshots). Keeps the wait purely elixir-gated without ADB spam.
@@ -1050,8 +1121,13 @@ def _fight_loop(
     _last_hold_record_key = None
     # Fresh elixir clock every battle — starts banked at 5 like a real match.
     _ELIXIR_TRACKER.start_match(time.time())
+    _watchdog_pulse()
 
     while True:
+        if _watchdog_stop_requested():
+            logger.change_status("Stop requested — leaving fight loop")
+            stop_fight_capture()
+            return False
         if not check_for_in_battle_with_delay(emulator):
             if check_if_battle_has_ended(emulator):
                 break
@@ -1078,6 +1154,11 @@ def _fight_loop(
         # Get elixir amount and thresholds based on current battle phase
         elixir_amount = battle_strategy.select_elixir_amount()
         wait_threshold, play_threshold = battle_strategy.get_thresholds()
+
+        # Temporary diagnostic (H2): entry id per outer-loop wait.
+        global _DIAG_WAIT_ENTRY_COUNT
+        _DIAG_WAIT_ENTRY_COUNT += 1
+        logger.log(f"DIAG [wait_entry #{_DIAG_WAIT_ENTRY_COUNT}] entering wait_for_elixir target={elixir_amount}")
 
         wait_output = wait_for_elixir(
             emulator,
@@ -1111,6 +1192,8 @@ def _fight_loop(
         logger.change_status(
             f"Made a play in {str(time.time() - play_start_time)[:4]}s",
         )
+        # Heartbeat: a completed play is the clearest progress signal.
+        _watchdog_pulse()
 
     # Fight over: freeze capture so the pack excludes post-fight nav (manifest/outcome written later).
     stop_fight_capture()
@@ -1138,7 +1221,12 @@ def _random_fight_loop(
     battle_detection_lost_count = 0
 
     # while in battle:
+    _watchdog_pulse()
     while True:
+        if _watchdog_stop_requested():
+            logger.change_status("Stop requested — leaving random fight loop")
+            stop_fight_capture()
+            return False
         if not check_for_in_battle_with_delay(emulator):
             if check_if_battle_has_ended(emulator):
                 break
@@ -1165,12 +1253,17 @@ def _random_fight_loop(
         # Clean random-play flow (mirrors rl-bot RandomPlayer): wait for a random
         # elixir gate, then play only if a card is actually available.
         target = random.randint(RANDOM_PLAY_ELIXIR_MIN, RANDOM_PLAY_ELIXIR_MAX)
+        # Temporary diagnostic (H2): entry id per outer-loop wait.
+        global _DIAG_WAIT_ENTRY_COUNT
+        _DIAG_WAIT_ENTRY_COUNT += 1
+        logger.log(f"DIAG [wait_entry #{_DIAG_WAIT_ENTRY_COUNT}] entering wait_for_elixir target={target}")
         elixir_result = wait_for_elixir(emulator, logger, target, recording_flag=recording_flag)
         if elixir_result == "no battle":
             break
         if elixir_result == "restart":
             return False
         play_random_available_card(emulator, logger, recording_flag, time.time() - start_time)
+        _watchdog_pulse()
 
     # Fight over: freeze capture so the pack excludes post-fight nav (manifest/outcome written later).
     stop_fight_capture()
