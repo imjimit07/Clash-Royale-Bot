@@ -1,0 +1,177 @@
+import traceback
+from multiprocessing import Process, Queue
+from multiprocessing.synchronize import Event
+from typing import Any, Protocol
+
+from clbot.bot.states import StateHistory, StateOrder, state_tree
+from clbot.emulators import EmulatorType, get_emulator_registry
+from clbot.emulators.base import EmulatorNotReadyError
+from clbot.interface.enums import UIField
+from clbot.utils.logger import ProcessLogger, attach_worker_file_logging
+
+
+class WorkerProcess(Process):
+    """Worker process for running the bot.
+
+    Uses multiprocessing instead of threading for reliable force termination.
+    Communicates stats back to main process via Queue.
+    """
+
+    def __init__(
+        self,
+        jobs: dict[str, Any],
+        stats_queue: Queue,
+        shutdown_event: Event,
+        session_log_path: str,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.jobs = jobs
+        self.stats_queue = stats_queue
+        self.shutdown_event = shutdown_event
+        self.session_log_path = session_log_path
+
+    def _setup_emulator(self, jobs: dict[str, Any], logger: ProcessLogger):
+        """Set up Google Play Games PC (Developer Mode) — the only supported backend."""
+        # Battle-only bot: always use Google Play Games, ignoring any legacy selection.
+        emulator_selection = EmulatorType.GOOGLE_PLAY
+        registry = get_emulator_registry()
+
+        if emulator_selection not in registry:
+            print("[!] Fatal error: Google Play Games emulator is not available on this platform!")
+            logger.change_status("Google Play Games is not available on this platform.")
+            return None
+
+        controller_class = registry[emulator_selection]
+
+        try:
+            print("Creating Google Play Games PC (Developer Mode) emulator")
+            gp_device_serial = jobs.get(UIField.GP_DEVICE_SERIAL.value) or None
+            emu = controller_class(logger=logger, device_serial=gp_device_serial)
+
+            # Construction is cheap; restart() boots the emulator and launches Clash.
+            # First-boot failure stops the bot — there is no setup retry.
+            emu.restart()
+            return emu
+
+        except EmulatorNotReadyError as e:
+            print(f"{emulator_selection} emulator is not ready: {e}")
+            logger.change_status(f"{emulator_selection} is not ready — fix it and start the bot again.")
+            return None
+        except Exception as e:
+            print(f"Failed to create {emulator_selection} emulator: {e}")
+            logger.change_status(f"Failed to start {emulator_selection}. Verify its installation!")
+            return None
+
+    def _run_bot_loop(self, emulator, jobs: dict[str, Any], logger: ProcessLogger) -> None:
+        """Run the main bot state loop."""
+        state = "start"
+        state_history = StateHistory(logger)
+        state_order = StateOrder()
+        consecutive_restarts = 0
+        max_consecutive_restarts = 5
+
+        while not self.shutdown_event.is_set():
+            try:
+                new_state = state_tree(emulator, logger, state, jobs, state_history, state_order)
+
+                # Check for restart loops
+                if new_state == "restart":
+                    consecutive_restarts += 1
+                    if consecutive_restarts >= max_consecutive_restarts:
+                        logger.error(
+                            f"Too many consecutive restarts ({consecutive_restarts}) - stopping bot to prevent infinite loop"
+                        )
+                        break
+                    logger.log(f"Restart #{consecutive_restarts} - attempting to recover")
+                else:
+                    consecutive_restarts = 0  # Reset counter on successful state
+
+                # Check for error states that should stop execution
+                if new_state in ["fail", None]:
+                    logger.error(f"Critical error: state_tree returned '{new_state}' - stopping bot")
+                    if new_state == "fail":
+                        logger.add_restart_after_failure()
+                    break
+
+                state = new_state
+
+            except Exception as e:
+                logger.error(f"Exception in state_tree: {e}")
+                logger.log(f"Current state was: {state}")
+                print(f"[ERROR] Exception in state_tree: {e}")
+                print(f"[ERROR] Current state was: {state}")
+                # Try to restart from a known state
+                state = "restart"
+                # If we keep getting exceptions, break out
+                traceback.print_exc()
+                consecutive_restarts += 1
+                if consecutive_restarts >= max_consecutive_restarts:
+                    logger.error("Too many consecutive exceptions - stopping bot")
+                    break
+
+            # Note: Pause functionality removed in multiprocessing version
+            # If pause is needed, use a separate mp.Event
+
+    def run(self) -> None:
+        """Main worker process execution."""
+        print("WorkerProcess run()...")
+        attach_worker_file_logging(self.session_log_path)
+
+        # Create logger that sends stats through queue
+        logger = ProcessLogger(self.stats_queue)
+
+        try:
+            emulator = self._setup_emulator(self.jobs, logger)
+            if emulator is None:
+                return
+
+            self._run_bot_loop(emulator, self.jobs, logger)
+        except Exception as err:
+            logger.error(str(err))
+            traceback.print_exc()
+        finally:
+            logger.change_status("Bot stopped")
+
+
+class _StoppableProcess(Protocol):
+    """Structural interface for the process-lifecycle methods ``stop_worker_process`` needs.
+
+    Satisfied by ``multiprocessing.Process`` (and ``WorkerProcess``), spawned context
+    processes, and test fakes alike — so the helper depends on the contract, not the
+    concrete class.
+    """
+
+    def is_alive(self) -> bool: ...
+    def terminate(self) -> None: ...
+    def join(self, timeout: float | None = ...) -> None: ...
+    def kill(self) -> None: ...
+
+
+class _Signal(Protocol):
+    """Structural interface for the shutdown event — only ``set()`` is used here."""
+
+    def set(self) -> None: ...
+
+
+def stop_worker_process(
+    process: _StoppableProcess | None,
+    shutdown_event: _Signal | None = None,
+    *,
+    graceful_timeout: float = 2.0,
+) -> None:
+    """Stop the worker process via OS-level termination.
+
+    Signals shutdown (belt-and-suspenders), then terminates and hard-kills if the
+    process does not exit within ``graceful_timeout``. The OS interrupts any blocking
+    call in the worker (sleeps, ADB/socket waits), so this does not depend on the
+    worker cooperatively noticing the shutdown event.
+    """
+    if shutdown_event is not None:
+        shutdown_event.set()
+    if process is None or not process.is_alive():
+        return
+    process.terminate()  # SIGTERM / TerminateProcess
+    process.join(timeout=graceful_timeout)
+    if process.is_alive():
+        process.kill()  # SIGKILL
+        process.join(timeout=graceful_timeout)
